@@ -17,6 +17,9 @@ import json
 import os
 import pathlib
 import sys
+import faulthandler
+import logging
+import logging.handlers
 import threading
 import time
 import tkinter as tk
@@ -42,6 +45,18 @@ PLACE = LOC.get("label", "Outside")
 REFERENCE_URL = LOC.get("reference_url", "https://www.aqi.in/")
 REFERENCE_NAME = LOC.get("reference_name", "aqi.in")
 POS_FILE = pathlib.Path(__file__).with_name("aqi_widget_pos.json")
+
+# pythonw has no console, so errors and crashes go to a small rotating log next to the script.
+LOG_FILE = pathlib.Path(__file__).with_name("aqi_widget.log")
+log = logging.getLogger("aqi_widget")
+log.setLevel(logging.INFO)
+if __name__ == "__main__":
+    _h = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=256_000, backupCount=1, encoding="utf-8")
+    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    log.addHandler(_h)
+    _crash_file = open(LOG_FILE.with_suffix(".crash.log"), "a", encoding="utf-8")
+    faulthandler.enable(_crash_file)  # hard crashes (e.g. inside Tk or a DLL) still leave a trace
+    log.info("widget started")
 
 # ── Air quality maths ──────────────────────────────────────────────────────
 BANDS = [  # India NAQI, PM2.5: (conc_lo, conc_hi, aqi_lo, aqi_hi, label)
@@ -952,7 +967,16 @@ class Widget(tk.Tk):
             self._schedule("in", 500, self.refresh_inside)
 
     def _got_inside(self, v, err):
+        try:
+            self._show_inside(v, err)
+        except Exception:
+            log.exception("inside update failed")
+        finally:  # whatever happens, keep refreshing
+            self._schedule("in", INSIDE_MS, self.refresh_inside)
+
+    def _show_inside(self, v, err):
         if err:
+            log.warning("inside read failed: %s", err)
             self.st["inside"] = "offline"
         else:
             self.st["vals"] = v
@@ -970,15 +994,20 @@ class Widget(tk.Tk):
             self._stamp()
         self._rebackdrop_if_wallpaper_changed()
         self.redraw()
-        self._schedule("in", INSIDE_MS, self.refresh_inside)
 
     def refresh_outside(self):
         self._bg(fetch_outdoor, self._got_outside)
 
     def _got_outside(self, res, err):
-        self.st["outside"] = "offline" if err else res
-        self.redraw()
-        self._schedule("out", OUTDOOR_MS, self.refresh_outside)
+        try:
+            if err:
+                log.warning("outside read failed: %s", err)
+            self.st["outside"] = "offline" if err else res
+            self.redraw()
+        except Exception:
+            log.exception("outside update failed")
+        finally:
+            self._schedule("out", OUTDOOR_MS, self.refresh_outside)
 
     def _rebackdrop_if_wallpaper_changed(self):
         key = self.r._wp_key
@@ -1043,9 +1072,18 @@ class Widget(tk.Tk):
             pass
 
     def close(self):
+        log.info("closed from the widget (✕ or menu)")
         self._save_pos()
         self.destroy()
 
 
 if __name__ == "__main__":
-    Widget().mainloop()
+    w = Widget()
+    # Tk swallows errors in callbacks; send them to the log instead of nowhere (pythonw has no console).
+    w.report_callback_exception = lambda *exc: log.error("callback error", exc_info=exc)
+    try:
+        w.mainloop()
+    except Exception:
+        log.exception("widget crashed")
+        raise
+    log.info("widget closed")

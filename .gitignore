@@ -1,6 +1,7 @@
 # Secrets and personal settings: never commit
 purifier.json
 aqi_widget_pos.json
+aqi_widget*.log*
 mi_devices.json
 *.token
 
