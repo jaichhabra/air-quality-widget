@@ -3,10 +3,20 @@
 > **On a Mac with a Qubo purifier?** See [mac/](mac/README.md) for the native
 > macOS version.
 
-A frosted-glass Windows 11 desktop widget that shows indoor air quality from a
-**Xiaomi Smart Air Purifier** next to outdoor air quality for your location, and
-lets you control the purifier. It talks to the purifier directly over your Wi-Fi,
-not through Xiaomi's cloud.
+A frosted-glass Windows 11 desktop widget that shows indoor air quality from
+your air purifiers next to outdoor air quality for your location, and lets you
+control them.
+
+Supported purifiers (each brand is a small driver in `purifier.py`):
+
+| Brand | Connection | Controls |
+| --- | --- | --- |
+| Xiaomi Smart Air Purifier 4 Compact | your Wi-Fi, direct | power, Auto/Sleep/Favorite, fan 0–14, child lock |
+| Qubo (HPH series) | Qubo cloud | power, Auto/Sleep/Manual, fan 1–3, child lock |
+
+The widget's controls adapt to each purifier. To add a brand, subclass
+`Driver` in `purifier.py`: declare its modes and fan range, implement `read()`
+and the setters, and add it to `DRIVERS`.
 
 - **Inside**: live PM2.5 from the purifier (every 30 s), shown as AQI with a
   colour scale, plus power, mode and fan speed controls.
@@ -69,6 +79,8 @@ does not build on Windows; `netifaces-plus` replaces it.
 | Power | Round button, bottom left (green when on) |
 | Mode and fan speed | Mode pill, opens a dropdown |
 | AQI scale, refresh, close | Right-click |
+| Show PM2.5 instead of AQI (the number purifier apps show) | Right-click → *Big number: PM2.5* |
+| Real station data outside (free WAQI token) | Right-click → *Use real station data outside…* |
 | Open your AQI reference page | Double-click Outside |
 
 ## Command line
@@ -89,7 +101,13 @@ python purifier.py screen off|dim|bright
 
 ## Notes
 
+- **Purifier apps show PM2.5, not AQI.** A Xiaomi app reading of 150 is
+  150 µg/m³ of PM2.5, which is about US AQI 225. The widget labels its big
+  number, and can show PM2.5 instead.
 - AQI here is computed from PM2.5 only, using live readings. Official indices
   also use other pollutants and 24-hour averages, so they can differ.
+- Without a WAQI token, Outside is a model estimate (Open-Meteo), which often
+  reads low in Indian cities. With a token it uses the nearest official station.
+- Tests: `python -m unittest discover tests` (offline, no purifier needed).
 - If the purifier's IP changes, update `purifier.json`, or reserve the address
   in your router.

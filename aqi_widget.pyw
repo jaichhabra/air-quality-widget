@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.parse
 import urllib.request
 import webbrowser
 import winreg
@@ -83,14 +84,20 @@ def fetch_outdoor():
     """(pm25 µg/m³, caption). Nearest station if a WAQI token is set, else Open-Meteo model."""
     lat, lon = HOME
     token = pur.CFG.get("waqi_token")
+    note = "estimate"
     if token:
-        d = json.load(urllib.request.urlopen(f"https://api.waqi.info/feed/geo:{lat};{lon}/?token={token}", timeout=15))
+        try:
+            d = json.load(urllib.request.urlopen(
+                f"https://api.waqi.info/feed/geo:{lat};{lon}/?token={urllib.parse.quote(token)}", timeout=15))
+        except Exception:
+            d = {}
         if d.get("status") == "ok" and "pm25" in d["data"].get("iaqi", {}):
             return us_index_to_pm25(d["data"]["iaqi"]["pm25"]["v"]), d["data"]["city"]["name"].split(",")[0]
+        note = "estimate (token not accepted)" if d.get("status") == "error" else "estimate (station offline)"
     d = json.load(urllib.request.urlopen(
         f"https://air-quality-api.open-meteo.com/v1/air-quality?latitude={lat}&longitude={lon}&current=pm2_5",
         timeout=15))
-    return d["current"]["pm2_5"], f"{PLACE} · estimate"
+    return d["current"]["pm2_5"], f"{PLACE} · {note}"
 
 
 # ── Design tokens (logical px) ─────────────────────────────────────────────
@@ -101,7 +108,9 @@ WIN_W, WIN_H = CARD_W + 2 * MARGIN, CARD_H + 2 * MARGIN
 POP_W, POP_H, POP_R = 236, 214, 18   # mode / fan-speed dropdown
 ROOM_W = 220                          # purifier (room) switcher
 BUTTONS = ("power", "mode", "room", "refresh", "close")
-FAN_MAX = 14                          # favourite fan level range on xiaomi.airp.cpa4m (siid 9, piid 11)
+def pop_h(n_modes, has_fan):
+    """Height of the mode/fan dropdown for a purifier with n_modes modes."""
+    return 8 + n_modes * 36 + (98 if has_fan else 8)
 PAD = 22
 GREEN = (48, 209, 88)
 SCALE = [(0, (48, 209, 88)), (100, (255, 214, 10)), (200, (255, 159, 10)),
@@ -300,15 +309,23 @@ class Renderer:
             else:
                 text(x, 32, glyph, 10.5, icon=True, fill=white(0.55))
                 text(x + 17, 32, title, 10.5, 600, white(0.55), track=0.9)
+            unit = ""
             if data is None:
                 num, cat, cap1, cap2, aqi = "—", "Loading…", "", "", None
             elif data == "offline":
                 num, cat, cap1, cap2, aqi = "—", "Unavailable", "Retrying shortly", "", None
             else:
                 pm, cap2 = data
-                aqi, cat = aqi_from_pm25(pm, st.get("scale", "us"))
-                num, cap1 = str(aqi), f"PM2.5 {pm:.0f} µg/m³"
-            text(x - 2, 86, num, 46, 600)
+                scale = st.get("scale", "us")
+                aqi, cat = aqi_from_pm25(pm, scale)
+                index = "US AQI" if scale == "us" else "NAQI"
+                if st.get("metric") == "pm25":  # same number the purifier's own app shows
+                    num, unit, cap1 = f"{pm:.0f}", "µg/m³", f"{index} {aqi}"
+                else:
+                    num, unit, cap1 = str(aqi), index, f"PM2.5 {pm:.0f} µg/m³"
+            w = text(x - 2, 86, num, 46, 600)
+            if unit:
+                text(x - 2 + w + 5, 86, unit, 10.5, 600, white(0.5))
             text(x, 109, cat, 15, 600)
             self._bar(img, ox + x, oy + 121, colw, aqi)
             text(x, 145, cap1, 11.5, 400, white(0.62))
@@ -341,7 +358,7 @@ class Renderer:
             x += ph + 8
 
             # mode: pill with chevron
-            mode = pur.MODES.get(v.get("mode"), "—").capitalize()
+            mode = v.get("mode_label") or "—"
             w = 14 + self.font(13, 600).getlength(mode) / self.k + 8 + 9 + 12
             rrect(x, fy - ph / 2, x + w, fy + ph / 2, ph / 2,
                   fill=white(0.20 if hov == "mode" else 0.11), outline=white(0.10), width=max(1, q(0.5)))
@@ -394,50 +411,61 @@ class Renderer:
         hits.append((6, y0, W - 6, y0 + 34, "add"))
         return img.resize((round(W * self.s), round(H * self.s)), Image.LANCZOS), hits
 
-    # dropdown: modes + fan speed
+    # dropdown: the purifier's own modes + fan speed (whatever its driver declares)
     def popup_content(self, st):
         q = self.q
-        img = Image.new("RGBA", (q(POP_W), q(POP_H)), (0, 0, 0, 0))
+        modes, has_fan = st["modes"], st["fan_range"] is not None
+        W, H = POP_W, pop_h(len(modes), has_fan)
+        img = Image.new("RGBA", (q(W), q(H)), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         hits, hov = [], st.get("hover")
-        mode, level = st["mode"], st["level"]
+        mode = st["mode"]
 
         def text(x, y, s, px, wght=400, fill=white(1), anchor="ls", icon=False):
             d.text((q(x), q(y)), s, font=self.font(px, wght, icon), fill=fill, anchor=anchor)
 
-        for i, name in enumerate(["Auto", "Sleep", "Favorite"]):
-            y0 = 8 + i * 36
-            tag = f"mode{i}"
+        for i, (key, label) in enumerate(modes):
+            y0, tag, cur = 8 + i * 36, f"mode{i}", key == mode
             if hov == tag:
-                d.rounded_rectangle([q(6), q(y0), q(POP_W - 6), q(y0 + 34)], q(10), fill=white(0.13))
-            text(18, y0 + 22, name, 13.5, 600 if i == mode else 400, white(1 if i == mode else 0.85))
-            if i == mode:
-                text(POP_W - 20, y0 + 17, "", 12, icon=True, fill=white(0.95), anchor="mm")
-            hits.append((6, y0, POP_W - 6, y0 + 34, tag))
+                d.rounded_rectangle([q(6), q(y0), q(W - 6), q(y0 + 34)], q(10), fill=white(0.13))
+            text(18, y0 + 22, label, 13.5, 600 if cur else 400, white(1 if cur else 0.85))
+            if cur:
+                text(W - 20, y0 + 17, "", 12, icon=True, fill=white(0.95), anchor="mm")
+            hits.append((6, y0, W - 6, y0 + 34, tag))
+        if not has_fan:
+            return img.resize((round(W * self.s), round(H * self.s)), Image.LANCZOS), hits
 
-        d.line([q(16), q(124), q(POP_W - 16), q(124)], fill=white(0.12), width=max(1, q(0.5)))
-        text(18, 150, "Fan speed", 12, 600, white(0.9))
-        text(POP_W - 18, 150, f"{level} / {FAN_MAX}", 12, 400, white(0.55), anchor="rs")
-        if mode != 2:
-            text(18, 166, "Adjusting switches to Favorite", 10.5, 400, white(0.42))
+        lo, hi = st["fan_range"]
+        level = max(lo, min(hi, st["level"] if st["level"] is not None else lo))
+        in_fan_mode = mode == st["fan_mode"]
+        yb = 8 + len(modes) * 36
+        d.line([q(16), q(yb + 8), q(W - 16), q(yb + 8)], fill=white(0.12), width=max(1, q(0.5)))
+        text(18, yb + 34, "Fan speed", 12, 600, white(0.9))
+        text(W - 18, yb + 34, f"{level} / {hi}", 12, 400, white(0.55), anchor="rs")
+        if not in_fan_mode:
+            text(18, yb + 50, f"Adjusting switches to {st['fan_label']}", 10.5, 400, white(0.42))
 
-        cy = 190
-        for cx, glyph, tag in [(26, "", "minus"), (POP_W - 26, "", "plus")]:
+        cy = yb + 74
+        for cx, glyph, tag in [(26, "", "minus"), (W - 26, "", "plus")]:
             d.ellipse([q(cx - 13), q(cy - 13), q(cx + 13), q(cy + 13)],
                       fill=white(0.22 if hov == tag else 0.11), outline=white(0.10), width=max(1, q(0.5)))
             text(cx, cy, glyph, 10, icon=True, fill=white(0.9), anchor="mm")
             hits.append((cx - 14, cy - 14, cx + 14, cy + 14, tag))
 
-        tx0, tx1, th = 50, POP_W - 50, 6
+        tx0, tx1, th = 50, W - 50, 6
         d.rounded_rectangle([q(tx0), q(cy - th / 2), q(tx1), q(cy + th / 2)], q(th / 2), fill=white(0.16))
-        kx = tx0 + (tx1 - tx0) * level / FAN_MAX
-        if level:
+        kx = tx0 + (tx1 - tx0) * (level - lo) / max(1, hi - lo)
+        if level > lo:
             d.rounded_rectangle([q(tx0), q(cy - th / 2), q(kx), q(cy + th / 2)], q(th / 2),
-                                fill=white(0.9 if mode == 2 else 0.55))
+                                fill=white(0.9 if in_fan_mode else 0.55))
+        if hi - lo <= 6:  # few speeds: show a tick for each
+            for s in range(lo, hi + 1):
+                tx = tx0 + (tx1 - tx0) * (s - lo) / max(1, hi - lo)
+                d.ellipse([q(tx - 2), q(cy - 2), q(tx + 2), q(cy + 2)], fill=white(0.5))
         d.ellipse([q(kx - 9.5), q(cy - 8.5), q(kx + 9.5), q(cy + 10.5)], fill=(0, 0, 0, 55))
         d.ellipse([q(kx - 9), q(cy - 9), q(kx + 9), q(cy + 9)], fill=(255, 255, 255, 255))
         hits.append((tx0 - 10, cy - 14, tx1 + 10, cy + 14, "track"))
-        return img.resize((round(POP_W * self.s), round(POP_H * self.s)), Image.LANCZOS), hits
+        return img.resize((round(W * self.s), round(H * self.s)), Image.LANCZOS), hits
 
     def _bar(self, img, x, y, w, aqi):
         q, h = self.q, 5
@@ -532,9 +560,11 @@ class Popup(tk.Toplevel):
             self.lw, self.lh = ROOM_W, room_popup_h(len(names))
             self.st = {"items": names, "sel": app.sel, "hover": None}
         else:
-            v = app.st["vals"]
-            self.lw, self.lh = POP_W, POP_H
-            self.st = {"mode": v.get("mode", 0), "level": int(v.get("fan_level") or 0), "hover": None}
+            v, p = app.st["vals"], app.cur
+            self.lw, self.lh = POP_W, pop_h(len(p.modes), p.fan_range is not None)
+            self.st = {"modes": p.modes, "mode": v.get("mode"), "level": v.get("fan"), "hover": None,
+                       "fan_range": p.fan_range, "fan_mode": p.fan_mode,
+                       "fan_label": p.mode_label(p.fan_mode)}
         W, H = round(self.lw * self.s), round(self.lh * self.s)
         self.overrideredirect(True)
         self.geometry(f"{W}x{H}+{x}+{y}")
@@ -574,9 +604,14 @@ class Popup(tk.Toplevel):
             self.cv.config(cursor="hand2" if tag else "")
             self.redraw()
 
+    def _clamp(self, level):
+        lo, hi = self.st["fan_range"]
+        return max(lo, min(hi, level))
+
     def _level_at(self, e):
+        lo, hi = self.st["fan_range"]
         tx0, tx1 = 50, POP_W - 50
-        return max(0, min(FAN_MAX, round((e.x / self.s - tx0) / (tx1 - tx0) * FAN_MAX)))
+        return self._clamp(lo + round((e.x / self.s - tx0) / (tx1 - tx0) * (hi - lo)))
 
     def _motion(self, e):
         if self._dragging:
@@ -602,10 +637,11 @@ class Popup(tk.Toplevel):
             self.st["level"] = self._level_at(e)
             self.redraw()
         elif tag in ("minus", "plus"):
-            self.st["level"] = max(0, min(FAN_MAX, self.st["level"] + (1 if tag == "plus" else -1)))
+            cur = self.st["level"] if self.st["level"] is not None else self.st["fan_range"][0]
+            self.st["level"] = self._clamp(cur + (1 if tag == "plus" else -1))
             self._commit_level()
         elif tag and tag.startswith("mode"):
-            self.app.set_mode(int(tag[-1]))
+            self.app.set_mode(self.st["modes"][int(tag[4:])][0])
             self.close()
 
     def _release(self, e):
@@ -614,7 +650,7 @@ class Popup(tk.Toplevel):
             self._commit_level()
 
     def _commit_level(self):
-        self.st["mode"] = 2
+        self.st["mode"] = self.st["fan_mode"]
         self.redraw()
         self.app.set_fan_level(self.st["level"])
 
@@ -651,7 +687,7 @@ class Widget(tk.Tk):
         self.cv.pack()
         self.prefs = self._load_prefs()
         self.st = {"inside": None, "outside": None, "vals": {}, "hover": None, "updated": "",
-                   "scale": self.prefs.get("scale", "us")}
+                   "scale": self.prefs.get("scale", "us"), "metric": self.prefs.get("metric", "aqi")}
         self._cfg_mtime = 0
         self.purifiers, self.sel = [], 0
         self._load_purifiers()
@@ -665,6 +701,14 @@ class Widget(tk.Tk):
         self.menu.add_separator()
         for key, label in SCALES.items():
             self.menu.add_radiobutton(label=label, value=key, variable=self.scale_var, command=self._set_scale)
+        self.metric_var = tk.StringVar(value=self.st["metric"])
+        self.menu.add_separator()
+        self.menu.add_radiobutton(label="Big number: AQI", value="aqi", variable=self.metric_var,
+                                  command=self._set_metric)
+        self.menu.add_radiobutton(label="Big number: PM2.5 (like the purifier's app)", value="pm25",
+                                  variable=self.metric_var, command=self._set_metric)
+        self.menu.add_separator()
+        self.menu.add_command(label="Use real station data outside…", command=self._ask_waqi_token)
         self.menu.add_separator()
         self.menu.add_command(label="Close widget", command=self.close)
 
@@ -749,7 +793,10 @@ class Widget(tk.Tk):
             return
         if kind == "room" and not self.purifiers:
             return self.add_purifier()
-        h = POP_H if kind == "mode" else room_popup_h(len(self.purifiers))
+        if kind == "mode":
+            h = pop_h(len(self.cur.modes), self.cur.fan_range is not None)
+        else:
+            h = room_popup_h(len(self.purifiers))
         x0, y0, x1, y1 = next(h_[:4] for h_ in self.hits if h_[4] == kind)
         px = self.winfo_x() + round(x0 * self.s)
         py = self.winfo_y() + round((y1 + 8) * self.s)
@@ -816,6 +863,28 @@ class Widget(tk.Tk):
         self._save_pos()
         self.redraw()
 
+    def _set_metric(self):
+        self.st["metric"] = self.prefs["metric"] = self.metric_var.get()
+        self._save_pos()
+        self.redraw()
+
+    def _ask_waqi_token(self):
+        """Outside defaults to a model estimate; a free WAQI token switches it to the nearest station."""
+        from tkinter import simpledialog
+        cfg = pur.load_cfg()
+        token = simpledialog.askstring(
+            "Real station data",
+            "Paste your free WAQI token (get one at aqicn.org/data-platform/token).\n"
+            "Outside will then show the nearest official monitoring station.\n"
+            "Leave empty to go back to the model estimate.",
+            initialvalue=cfg.get("waqi_token", ""), parent=self)
+        if token is None:
+            return
+        cfg["waqi_token"] = pur.CFG["waqi_token"] = token.strip()
+        pur.save_cfg(cfg)
+        self._cfg_mtime = 0
+        self.refresh_outside()
+
     def _on_double(self, e):
         if self._hit(e) == "outside":
             webbrowser.open(REFERENCE_URL)
@@ -862,15 +931,16 @@ class Widget(tk.Tk):
             self.st["inside"] = "offline"
         else:
             self.st["vals"] = v
+            p = self.cur
             if not v["power"]:
                 cap = "Purifier is off"
-            elif v["mode"] == 2:
-                cap = f"Purifier · Fan {v['fan_level']}"
+            elif p and v.get("mode") == p.fan_mode and v.get("fan") is not None:
+                cap = f"Purifier · Fan {v['fan']}"
             else:
-                cap = "Purifier · " + pur.MODES.get(v["mode"], "").capitalize()
-            self.st["inside"] = (v["pm25"], cap)
+                cap = "Purifier · " + v.get("mode_label", "")
+            self.st["inside"] = (v["pm25"], cap) if v.get("pm25") is not None else "offline"
             if self.popup and self.popup.kind == "mode" and not self.popup._dragging:
-                self.popup.st["mode"], self.popup.st["level"] = v["mode"], int(v["fan_level"] or 0)
+                self.popup.st["mode"], self.popup.st["level"] = v.get("mode"), v.get("fan")
                 self.popup.redraw()
             self._stamp()
         self._rebackdrop_if_wallpaper_changed()
@@ -895,31 +965,23 @@ class Widget(tk.Tk):
         if v:
             new = not v["power"]
             p = self.cur
-            self._bg(lambda: p.set_prop("power", new), lambda *_: self.refresh_inside())
+            self._bg(lambda: p.set_power(new), lambda *_: self.refresh_inside())
 
-    def set_mode(self, mode):
-        if self.st["vals"]:
-            self.st["vals"]["mode"] = mode
+    def set_mode(self, key):
+        v, p = self.st["vals"], self.cur
+        if v and p:
+            v["mode"], v["mode_label"] = key, p.mode_label(key)
             self.redraw()
-            p = self.cur
-            self._bg(lambda: p.set_prop("mode", mode), lambda *_: self.refresh_inside())
+            self._bg(lambda: p.set_mode(key), lambda *_: self.refresh_inside())
 
     def set_fan_level(self, level):
-        """Fan level only applies in Favorite mode, so switch to it as well."""
-        v = self.st["vals"]
-        if not v:
+        """The driver also switches to the mode the fan speed belongs to (Favorite, Manual…)."""
+        v, p = self.st["vals"], self.cur
+        if not (v and p and p.fan_range):
             return
-        switch = v.get("mode") != 2
-        v["mode"], v["fan_level"] = 2, level
+        v["mode"], v["mode_label"], v["fan"] = p.fan_mode, p.mode_label(p.fan_mode), level
         self.redraw()
-
-        p = self.cur
-
-        def send():
-            p.set_prop("fan_level", level)
-            if switch:
-                p.set_prop("mode", 2)
-        self._bg(send, lambda *_: self.refresh_inside())
+        self._bg(lambda: p.set_fan(level), lambda *_: self.refresh_inside())
 
     # desktop placement
     def _hwnd(self):
