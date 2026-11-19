@@ -1,5 +1,8 @@
 # Air Quality desktop widget
 
+> **On a Mac with a Qubo purifier?** See [mac/](mac/README.md) for the native
+> macOS version.
+
 A frosted-glass Windows 11 desktop widget that shows indoor air quality from a
 **Xiaomi Smart Air Purifier** next to outdoor air quality for your location, and
 lets you control the purifier. It talks to the purifier directly over your Wi-Fi,

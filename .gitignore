@@ -4,5 +4,9 @@ aqi_widget_pos.json
 mi_devices.json
 *.token
 
+mac/.build/
+mac/dist/
+mac/.swiftpm/
+
 __pycache__/
 *.pyc

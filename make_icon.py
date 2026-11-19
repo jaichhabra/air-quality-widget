@@ -54,5 +54,5 @@ def draw(size=1024):
 if __name__ == "__main__":
     out = pathlib.Path(__file__).with_name("icon.ico")
     draw().resize((256, 256), Image.LANCZOS).save(out, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
-    draw().resize((256, 256), Image.LANCZOS).save(out.with_suffix(".png"))
+    draw().save(out.with_suffix(".png"))  # 1024 px, also the source of the macOS .icns
     print("wrote", out)
