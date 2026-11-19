@@ -13,6 +13,19 @@ Supported purifiers (each brand is a small driver in `purifier.py`):
 | --- | --- | --- |
 | Xiaomi Smart Air Purifier 4 Compact | your Wi-Fi, direct | power, Auto/Sleep/Favorite, fan 0–14, child lock |
 | Qubo (HPH series) | Qubo cloud | power, Auto/Sleep/Manual, fan 1–3, child lock |
+| Philips with Wi-Fi (AC0850, AC0950, AC1715, AC2729, AC2889, AC29xx, AC3033, AC3829, AC4236…) | your Wi-Fi, direct (CoAP) | power, Auto/Sleep/Manual, model's fan steps, child lock |
+| Dyson Pure / Purifier fans | your Wi-Fi, direct (MQTT); one-time Dyson sign-in | power, Auto/Night/Manual, fan 1–10 |
+
+Philips and Dyson support is built from open-source work but hasn't been tried
+on real purifiers here yet; please report what works. Dyson needs
+`pip install libdyson-neon` (the add wizard offers to install it). Older Dyson
+Pure Cool Link models don't report PM2.5 in µg/m³, so Inside shows as unavailable
+for them.
+
+Credits: Qubo endpoints follow [qubopy](https://github.com/selvakk2k/qubopy);
+Philips protocol follows [aioairctrl](https://github.com/betaboon/aioairctrl) and
+model mappings [philips-airpurifier-coap](https://github.com/kongo09/philips-airpurifier-coap);
+Dyson uses [libdyson-neon](https://github.com/libdyson-wg/libdyson-neon). All MIT.
 
 The widget's controls adapt to each purifier. To add a brand, subclass
 `Driver` in `purifier.py`: declare its modes and fan range, implement `read()`

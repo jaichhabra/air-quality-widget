@@ -5,6 +5,8 @@ Purifiers are listed in purifier.json (see purifier.example.json). Each entry ha
 
   xiaomi   Xiaomi Smart Air Purifier 4 Compact (xiaomi.airp.cpa4m), local network (miIO)
   qubo     Qubo smart air purifiers (HPH series), Qubo cloud
+  philips  Philips air purifiers with Wi-Fi (CoAP), local network
+  dyson    Dyson Pure / Purifier fans, local network (needs: pip install libdyson-neon)
 
 Adding a brand = one Driver subclass (see the Driver class) plus a branch in `cmd_add`.
 
@@ -24,9 +26,13 @@ Usage:
   remove NAME                 remove a purifier
 """
 import base64
+import concurrent.futures
+import hashlib
 import ipaddress
 import json
+import os
 import pathlib
+import random
 import select
 import socket
 import sys
@@ -426,7 +432,377 @@ class QuboDriver(Driver):
         self._attr("childLockControl", "state", "enable" if on else "disable")
 
 
-DRIVERS = {"xiaomi": XiaomiDriver, "qubo": QuboDriver}
+# ── Philips (local CoAP) ───────────────────────────────────────────────────
+class PhilipsCoAP:
+    """Minimal client for Philips purifiers' encrypted CoAP API (UDP 5683).
+
+    Protocol and encryption follow aioairctrl (github.com/betaboon/aioairctrl, MIT): sync a
+    session key, then AES-CBC payloads with key/IV from md5("JiangPan" + key) and a SHA-256
+    check. Built on the standard library + `cryptography` instead of aiocoap/pycryptodomex.
+    """
+    SECRET = "JiangPan"
+    GET, POST = 0x01, 0x02
+
+    def __init__(self, host, port=5683, timeout=5):
+        self.addr = (host, port)
+        self.timeout = timeout
+        self.key = None
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def close(self):
+        self.sock.close()
+
+    # CoAP framing
+    @staticmethod
+    def _ext(n):
+        if n < 13:
+            return n, b""
+        if n < 269:
+            return 13, bytes([n - 13])
+        return 14, (n - 269).to_bytes(2, "big")
+
+    @classmethod
+    def packet(cls, code, path, payload=b"", observe=False, token=None, mid=None):
+        token = token if token is not None else os.urandom(4)
+        mid = mid if mid is not None else random.randrange(65536)
+        opts = ([(6, b"")] if observe else []) + [(11, s.encode()) for s in path.strip("/").split("/")]
+        body, last = b"", 0
+        for num, val in opts:  # already in option-number order: Observe (6) before Uri-Path (11)
+            d, dx = cls._ext(num - last)
+            ln, lx = cls._ext(len(val))
+            body += bytes([(d << 4) | ln]) + dx + lx + val
+            last = num
+        head = bytes([0x50 | len(token), code]) + mid.to_bytes(2, "big") + token  # v1, NON
+        return head + body + ((b"\xff" + payload) if payload else b"")
+
+    @staticmethod
+    def parse(data):
+        """-> (type, code, mid, token, payload)"""
+        tkl = data[0] & 0x0F
+        i = 4 + tkl
+        while i < len(data) and data[i] != 0xFF:
+            d, ln = data[i] >> 4, data[i] & 0x0F
+            i += 1
+            i += {13: 1, 14: 2}.get(d, 0)
+            if ln == 13:
+                ln, i = data[i] + 13, i + 1
+            elif ln == 14:
+                ln, i = int.from_bytes(data[i:i + 2], "big") + 269, i + 2
+            i += ln
+        payload = data[i + 1:] if i < len(data) else b""
+        return (data[0] >> 4) & 3, data[1], data[2:4], data[4:4 + tkl], payload
+
+    def _request(self, code, path, payload=b"", observe=False):
+        token = os.urandom(4)
+        self.sock.sendto(self.packet(code, path, payload, observe, token), self.addr)
+        deadline = time.time() + self.timeout
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                raise TimeoutError(f"No answer from the Philips purifier at {self.addr[0]}")
+            self.sock.settimeout(left)
+            try:
+                data, _ = self.sock.recvfrom(8192)
+            except socket.timeout:
+                continue
+            except OSError:  # Windows reports ICMP "port unreachable" as an error
+                continue
+            typ, _, mid, tok, body = self.parse(data)
+            if typ == 0:  # confirmable reply: acknowledge it
+                self.sock.sendto(bytes([0x60, 0]) + mid, self.addr)
+            # These purifiers reuse message ids, so match on the token, never de-duplicate.
+            if tok == token:
+                return body
+
+    # encryption
+    def _cipher(self, key):
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        kv = hashlib.md5((self.SECRET + key).encode()).hexdigest().upper()
+        return Cipher(algorithms.AES(kv[:16].encode()), modes.CBC(kv[16:].encode()))
+
+    def encrypt(self, text):
+        from cryptography.hazmat.primitives import padding
+        self.key = ((int(self.key, 16) + 1) & 0xFFFFFFFF).to_bytes(4, "big").hex().upper()
+        p = padding.PKCS7(128).padder()
+        data = p.update(text.encode()) + p.finalize()
+        e = self._cipher(self.key).encryptor()
+        ct = (e.update(data) + e.finalize()).hex().upper()
+        return self.key + ct + hashlib.sha256((self.key + ct).encode()).hexdigest().upper()
+
+    def decrypt(self, s):
+        from cryptography.hazmat.primitives import padding
+        key, ct, digest = s[:8], s[8:-64], s[-64:]
+        if hashlib.sha256((key + ct).encode()).hexdigest().upper() != digest:
+            raise ValueError("Philips reply failed its checksum")
+        d = self._cipher(key).decryptor()
+        data = d.update(bytes.fromhex(ct)) + d.finalize()
+        u = padding.PKCS7(128).unpadder()
+        return (u.update(data) + u.finalize()).decode()
+
+    # API
+    def sync(self):
+        self.key = self._request(self.POST, "/sys/dev/sync", os.urandom(4).hex().upper().encode()).decode()
+        return self.key
+
+    def status(self):
+        body = self._request(self.GET, "/sys/dev/status", observe=True).decode()
+        return json.loads(self.decrypt(body))["state"]["reported"]
+
+    def control(self, data):
+        desired = {"state": {"desired": {"CommandType": "app", "DeviceId": "", "EnduserId": "", **data}}}
+        body = self._request(self.POST, "/sys/dev/control", self.encrypt(json.dumps(desired)).encode())
+        try:
+            return json.loads(body).get("status") == "success"
+        except ValueError:
+            return False
+
+
+# Modes and fan steps per model family, as the key/value patterns the purifier reports and
+# accepts. Taken from the philips-airpurifier-coap Home Assistant integration (kongo09, MIT).
+PHILIPS_PROFILES = {
+    "classic": {   # AC2729, AC2889, AC3829, AC1214…  keys pwr / mode / om / pm25 / cl
+        "power": ("pwr", "1", "0"), "pm25": "pm25", "lock": ("cl", True, False),
+        "modes": [("auto", "Auto", {"mode": "P"}), ("sleep", "Sleep", {"mode": "S"}),
+                  ("manual", "Manual", {"mode": "M"})],
+        "speeds": [{"mode": "M", "om": "1"}, {"mode": "M", "om": "2"}, {"mode": "M", "om": "3"},
+                   {"mode": "M", "om": "t"}],
+    },
+    "classic_ag": {  # AC29xx, AC3021, AC305x, AC3836, AC385x, AC4236, AC4558
+        "power": ("pwr", "1", "0"), "pm25": "pm25", "lock": ("cl", True, False),
+        "modes": [("auto", "Auto", {"mode": "AG"}), ("sleep", "Sleep", {"mode": "S"}),
+                  ("manual", "Manual", {"mode": "GT"})],
+        "speeds": [{"mode": "GT"}, {"mode": "T"}],          # Gentle, Turbo
+    },
+    "gen2": {      # AC1715, AC0850 (AWS_Philips_AIR firmware)
+        "power": ("D03-02", "ON", "OFF"), "pm25": "D03-33", "lock": None,
+        "modes": [("auto", "Auto", {"D03-12": "Auto General"}), ("sleep", "Sleep", {"D03-12": "Sleep"}),
+                  ("manual", "Manual", {"D03-12": "Gentle/Speed 1"})],
+        "speeds": [{"D03-12": "Gentle/Speed 1"}, {"D03-12": "Speed 2"}, {"D03-12": "Turbo"}],
+    },
+    "gen3": {      # newest firmware (…_Combo): numeric keys
+        "power": ("D03102", 1, 0), "pm25": "D03221", "lock": ("D03103", 1, 0),
+        "modes": [("auto", "Auto", {"D0310C": 0}), ("sleep", "Sleep", {"D0310C": 17}),
+                  ("manual", "Manual", {"D0310C": 19})],
+        "speeds": [{"D0310C": 19}, {"D0310C": 18}],         # Medium, Turbo
+    },
+    "gen3_ac0950": {
+        "power": ("D03102", 1, 0), "pm25": "D03221", "lock": ("D03103", 1, 0),
+        "modes": [("auto", "Auto", {"D0310C": 0, "D0310D": 1}), ("sleep", "Sleep", {"D0310C": 17, "D0310D": 1}),
+                  ("manual", "Manual", {"D0310C": 19, "D0310D": 2})],
+        "speeds": [{"D0310C": 17, "D0310D": 1}, {"D0310C": 19, "D0310D": 2}, {"D0310C": 18, "D0310D": 18}],
+    },
+}
+PHILIPS_AG_MODELS = ("AC29", "AC3021", "AC305", "AC3836", "AC385", "AC4236", "AC4558")
+
+
+def philips_profile(status):
+    """Pick the profile for a purifier from its own status report -> (profile, model)."""
+    if "D01S05" in status:
+        model = str(status["D01S05"])
+        return ("gen3_ac0950" if model.startswith(("AC0950", "AC0951")) else "gen3"), model
+    if "D01-05" in status:
+        return "gen2", str(status["D01-05"])
+    model = str(status.get("modelid") or status.get("type") or "")
+    return ("classic_ag" if model.upper().startswith(PHILIPS_AG_MODELS) else "classic"), model
+
+
+def _matches(status, pattern):
+    return all(status.get(k) == v for k, v in pattern.items())
+
+
+class PhilipsDriver(Driver):
+    BRAND = "Philips"
+    FAN_MODE = "manual"
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.p = PHILIPS_PROFILES[cfg.get("profile", "classic")]
+        self.MODES = [(k, label) for k, label, _ in self.p["modes"]]
+        self.FAN_RANGE = (1, len(self.p["speeds"]))
+        self.HAS_LOCK = self.p["lock"] is not None
+
+    def _client(self):
+        c = PhilipsCoAP(self.cfg["ip"], self.cfg.get("port", 5683))
+        try:
+            c.sync()
+        except Exception:
+            c.close()
+            raise
+        return c
+
+    def status(self):
+        c = self._client()
+        try:
+            return c.status()
+        finally:
+            c.close()
+
+    def read(self):
+        s, p = self.status(), self.p
+        fan = next((i + 1 for i, pat in enumerate(p["speeds"]) if _matches(s, pat)), None)
+        mode = next((k for k, _, pat in p["modes"] if k != "manual" and _matches(s, pat)), None)
+        if mode is None and fan is not None:
+            mode = "manual"
+        lock = None
+        if p["lock"] and p["lock"][0] in s:
+            lock = s[p["lock"][0]] == p["lock"][1]
+        power_key, on, _ = p["power"]
+        return {"power": s.get(power_key) == on, "pm25": _as_int(s.get(p["pm25"])), "mode": mode,
+                "fan": fan if mode == "manual" else None, "lock": lock, "filter": None, "raw": s}
+
+    def _write(self, data):
+        c = self._client()
+        try:
+            if not c.control(data):
+                c.sync()
+                if not c.control(data):
+                    raise RuntimeError(f"{self.cfg.get('name', 'Philips purifier')} refused {data}")
+        finally:
+            c.close()
+
+    def _on(self):
+        key, on, _ = self.p["power"]
+        return {key: on}
+
+    def set_power(self, on):
+        key, v_on, v_off = self.p["power"]
+        self._write({key: v_on if on else v_off})
+
+    def set_mode(self, key):
+        pattern = next(pat for k, _, pat in self.p["modes"] if k == key)
+        self._write({**self._on(), **pattern})
+
+    def set_fan(self, level):
+        speeds = self.p["speeds"]
+        self._write({**self._on(), **speeds[max(1, min(len(speeds), int(level))) - 1]})
+
+    def set_lock(self, on):
+        if not self.p["lock"]:
+            raise RuntimeError("This Philips model has no child lock")
+        key, v_on, v_off = self.p["lock"]
+        self._write({key: v_on if on else v_off})
+
+
+def scan_philips(seconds=3):
+    """Find Philips purifiers: send a CoAP sync to every address on the /24 -> {ip: model?}."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setblocking(False)
+    pkt = PhilipsCoAP.packet(PhilipsCoAP.POST, "/sys/dev/sync", b"0000000A")
+    for host in local_subnet().hosts():
+        try:
+            s.sendto(pkt, (str(host), 5683))
+        except OSError:
+            pass
+    found, end = [], time.time() + seconds
+    while time.time() < end:
+        if select.select([s], [], [], 0.3)[0]:
+            try:
+                data, (ip, _) = s.recvfrom(2048)
+            except OSError:
+                continue
+            payload = PhilipsCoAP.parse(data)[4]
+            if len(payload) == 8 and ip not in found:
+                found.append(ip)
+    s.close()
+    return found
+
+
+# ── Dyson (local MQTT via libdyson-neon) ───────────────────────────────────
+def _libdyson():
+    try:
+        import libdyson
+        return libdyson
+    except ImportError:
+        raise RuntimeError("Dyson support needs the libdyson-neon library:  pip install libdyson-neon")
+
+
+_dyson_devices = {}  # serial -> connected libdyson device (MQTT connection kept open)
+
+
+def _safe(fn):
+    try:
+        return fn()
+    except Exception:
+        return None
+
+
+class DysonDriver(Driver):
+    """Dyson Pure / Purifier fans. Uses libdyson-neon (github.com/libdyson-wg/libdyson-neon, MIT).
+    The purifier's local MQTT login (serial + credential) comes once from the Dyson account."""
+    BRAND = "Dyson"
+    MODES = [("auto", "Auto"), ("night", "Night"), ("manual", "Manual")]
+    FAN_RANGE = (1, 10)
+    FAN_MODE = "manual"
+    HAS_LOCK = False
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.lib = _libdyson()
+
+    def device(self):
+        serial = self.cfg["serial"]
+        d = _dyson_devices.get(serial)
+        if d is None or not d.is_connected:
+            d = self.lib.get_device(serial, self.cfg["credential"], self.cfg["device_type"])
+            if d is None:
+                raise RuntimeError(f"Unsupported Dyson model ({self.cfg['device_type']})")
+            d.connect(self.cfg["ip"])
+            _dyson_devices[serial] = d
+        return d
+
+    def read(self):
+        d = self.device()
+        _safe(d.request_environmental_data)  # the answer arrives in the background
+        if _safe(lambda: d.night_mode):
+            mode = "night"
+        elif _safe(lambda: d.auto_mode):
+            mode = "auto"
+        else:
+            mode = "manual"
+        return {"power": bool(_safe(lambda: d.is_on)),
+                # Pure Cool Link models report particulates on their own scale, not µg/m³: shown as unavailable
+                "pm25": _safe(lambda: d.particulate_matter_2_5),
+                "mode": mode, "fan": _safe(lambda: d.speed) if mode == "manual" else None,
+                "lock": None, "filter": _safe(lambda: d.hepa_filter_life), "raw": {}}
+
+    def set_power(self, on):
+        d = self.device()
+        d.turn_on() if on else d.turn_off()
+
+    def set_mode(self, key):
+        d = self.device()
+        if key == "night":
+            d.enable_night_mode()
+            return
+        if _safe(lambda: d.night_mode):
+            d.disable_night_mode()
+        d.enable_auto_mode() if key == "auto" else d.disable_auto_mode()
+
+    def set_fan(self, level):
+        d = self.device()
+        if _safe(lambda: d.night_mode):
+            d.disable_night_mode()
+        if _safe(lambda: d.auto_mode):
+            d.disable_auto_mode()
+        d.set_speed(max(1, min(10, int(level))))
+
+    def set_lock(self, on):
+        raise RuntimeError("Dyson purifiers have no child lock")
+
+
+def scan_tcp(port, timeout=0.6):
+    """Hosts on the /24 with `port` open (Dyson purifiers listen for MQTT on 1883)."""
+    def probe(host):
+        try:
+            with socket.create_connection((str(host), port), timeout=timeout):
+                return str(host)
+        except OSError:
+            return None
+    with concurrent.futures.ThreadPoolExecutor(64) as pool:
+        return [h for h in pool.map(probe, local_subnet().hosts()) if h]
+
+
+DRIVERS = {"xiaomi": XiaomiDriver, "qubo": QuboDriver, "philips": PhilipsDriver, "dyson": DysonDriver}
 
 
 # ── purifier (what the widget and CLI use) ─────────────────────────────────
@@ -575,12 +951,121 @@ def cmd_add():
     print("\nAdd an air purifier\n───────────────────")
     print("  1. Xiaomi   (on your Wi-Fi)")
     print("  2. Qubo     (through your Qubo account)")
-    brand = ask("Brand")
-    if brand in ("1", "xiaomi", "Xiaomi"):
-        return add_xiaomi()
-    if brand in ("2", "qubo", "Qubo"):
-        return add_qubo()
+    print("  3. Philips  (on your Wi-Fi)")
+    print("  4. Dyson    (on your Wi-Fi; one-time Dyson account sign-in)")
+    brand = (ask("Brand") or "").lower()
+    adders = {"1": add_xiaomi, "xiaomi": add_xiaomi, "2": add_qubo, "qubo": add_qubo,
+              "3": add_philips, "philips": add_philips, "4": add_dyson, "dyson": add_dyson}
+    if brand in adders:
+        return adders[brand]()
     print("Cancelled." if not brand else f"{brand!r} isn't supported yet.")
+
+
+def pick_ip(found, known, what):
+    """Show discovered addresses, return the chosen IP (or None)."""
+    new = [ip for ip in found if ip not in known]
+    for i, ip in enumerate(new, 1):
+        print(f"  {i}. {ip}")
+    if not new:
+        print(f"  No new {what} found (already-added ones are hidden).")
+    choice = ask("\nNumber from the list, or type the purifier's IP address")
+    if not choice:
+        return None
+    if choice.isdigit() and 1 <= int(choice) <= len(new):
+        return new[int(choice) - 1]
+    try:
+        return str(ipaddress.ip_address(choice))
+    except ValueError:
+        print(f"{choice!r} is not a number from the list or an IP address.")
+        return None
+
+
+def add_philips():
+    cfg = load_cfg()
+    known = {c.get("ip") for c in cfg["purifiers"]}
+    print("\nLooking for Philips purifiers on your network…")
+    ip = pick_ip(scan_philips(), known, "Philips purifiers")
+    if not ip:
+        return print("Cancelled.")
+    print("Connecting…")
+    c = PhilipsCoAP(ip)
+    try:
+        c.sync()
+        status = c.status()
+    except Exception as e:
+        return print(f"Could not talk to a Philips purifier at {ip}: {e}")
+    finally:
+        c.close()
+    profile, model = philips_profile(status)
+    print(f"Connected: {model or 'Philips purifier'}  (profile: {profile})")
+    default = status.get("name") or status.get("D01-03") or status.get("D01S03") or "Philips"
+    name = ask("Name to show on the widget", str(default))
+    cfg["purifiers"].append({"type": "philips", "name": name, "ip": ip, "profile": profile, "model": model})
+    save_cfg(cfg)
+    print(f"\nAdded {name}. The widget picks it up automatically: click the room name to switch.")
+
+
+def add_dyson():
+    try:
+        lib = _libdyson()
+    except RuntimeError:
+        if (ask("Dyson support needs the libdyson-neon library. Install it now? (y/n)", "y") or "").lower() != "y":
+            return print("Cancelled.")
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "libdyson-neon"])
+        import importlib
+        importlib.invalidate_caches()
+        lib = _libdyson()
+    from libdyson.cloud import DysonAccount
+
+    print("\nSign in to your Dyson account once to get each purifier's local login.")
+    print("Dyson emails you a code. Your password goes only to Dyson and isn't saved.")
+    region = (ask("Country of your Dyson account (two letters, e.g. IN, US, GB)", "IN") or "IN").upper()
+    email = ask("Email")
+    if not email:
+        return print("Cancelled.")
+    account = DysonAccount()
+    try:
+        verify = account.login_email_otp(email, region)
+        password = ask("Password (not shown)", secret=True)
+        code = ask("Code from Dyson's email")
+        verify(code, password)
+        infos = account.devices()
+    except Exception as e:
+        return print(f"Dyson sign-in failed: {e}")
+
+    cfg = load_cfg()
+    known = {c.get("serial") for c in cfg["purifiers"] if c.get("type") == "dyson"}
+    vacuums = {getattr(lib, n) for n in dir(lib) if n.startswith("DEVICE_TYPE_360")}
+    devices = []
+    for info in infos:
+        dtype = _safe(info.get_device_type) or info.product_type
+        if info.serial not in known and dtype not in vacuums:
+            devices.append((info, dtype))
+    if not devices:
+        return print("No new Dyson purifiers in this account (already-added ones are hidden).")
+    for i, (info, dtype) in enumerate(devices, 1):
+        print(f"  {i}. {info.name:<24} {info.serial}  (type {dtype})")
+    choice = ask("Number", "1")
+    if not (choice and choice.isdigit() and 1 <= int(choice) <= len(devices)):
+        return print("Cancelled.")
+    info, dtype = devices[int(choice) - 1]
+
+    print("\nLooking for Dyson devices on your network…")
+    ip = pick_ip(scan_tcp(1883), {c.get("ip") for c in cfg["purifiers"]}, "Dyson devices")
+    if not ip:
+        return print("Cancelled.")
+    entry = {"type": "dyson", "name": info.name, "ip": ip, "serial": info.serial,
+             "credential": info.credential, "device_type": dtype, "model": info.product_type}
+    try:
+        DysonDriver(entry).read()
+        print("Connected.")
+    except Exception as e:
+        return print(f"Could not connect to {info.name} at {ip}: {e}")
+    entry["name"] = ask("Name to show on the widget", info.name)
+    cfg["purifiers"].append(entry)
+    save_cfg(cfg)
+    print(f"\nAdded {entry['name']}. The widget picks it up automatically: click the room name to switch.")
 
 
 def add_xiaomi():
