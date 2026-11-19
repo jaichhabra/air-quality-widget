@@ -117,7 +117,7 @@ MARGIN = 0                  # window = card; corners are truly transparent
 WIN_W, WIN_H = CARD_W + 2 * MARGIN, CARD_H + 2 * MARGIN
 POP_W, POP_H, POP_R = 236, 214, 18   # mode / fan-speed dropdown
 ROOM_W = 220                          # purifier (room) switcher
-BUTTONS = ("power", "mode", "room", "refresh", "close")
+BUTTONS = ("power", "mode", "room", "unit", "refresh", "close")
 def pop_h(n_modes, has_fan):
     """Height of the mode/fan dropdown for a purifier with n_modes modes."""
     return 8 + n_modes * 36 + (98 if has_fan else 8)
@@ -334,8 +334,15 @@ class Renderer:
                 else:
                     num, unit, cap1 = str(aqi), index, f"PM2.5 {pm:.0f} µg/m³"
             w = text(x - 2, 86, num, 46, 600)
-            if unit:
-                text(x - 2 + w + 5, 86, unit, 10.5, 600, white(0.5))
+            if unit:  # also a button: click to switch between PM2.5 and AQI
+                hot = st.get("hover") == "unit"
+                ux = x - 2 + w + 6
+                uw = self.font(10.5, 600).getlength(unit) / self.k
+                if hot:
+                    rrect(ux - 6, 71, ux + uw + 17, 91, 10, fill=white(0.14))
+                text(ux, 86, unit, 10.5, 600, white(0.9 if hot else 0.5))
+                text(ux + uw + 4, 85.5, "", 7.5, icon=True, fill=white(0.9 if hot else 0.38))
+                hits.append((ox + ux - 6, oy + 71, ox + ux + uw + 17, oy + 91, "unit"))
             text(x, 109, cat, 15, 600)
             self._bar(img, ox + x, oy + 121, colw, aqi)
             text(x, 145, cap1, 11.5, 400, white(0.62))
@@ -791,6 +798,7 @@ class Widget(tk.Tk):
         elif self._pressed and self._pressed == self._hit(e):
             {"power": self.toggle_power, "mode": lambda: self.toggle_popup("mode"),
              "room": lambda: self.toggle_popup("room"),
+             "unit": self.toggle_metric,
              "refresh": self.refresh_all, "close": self.close}[self._pressed]()
 
     def toggle_popup(self, kind):
@@ -874,6 +882,11 @@ class Widget(tk.Tk):
         self.st["scale"] = self.prefs["scale2"] = self.scale_var.get()
         self._save_pos()
         self.redraw()
+
+    def toggle_metric(self):
+        """Clicking the unit label flips both sides between PM2.5 and AQI."""
+        self.metric_var.set("aqi" if self.st["metric"] == "pm25" else "pm25")
+        self._set_metric()
 
     def _set_metric(self):
         self.st["metric"] = self.prefs["metric"] = self.metric_var.get()
