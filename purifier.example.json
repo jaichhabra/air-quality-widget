@@ -1,8 +1,12 @@
 {
-  "name": "Air Purifier",
-  "ip": "192.168.1.50",
-  "token": "00000000000000000000000000000000",
-  "model": "xiaomi.airp.cpa4m",
+  "purifiers": [
+    {
+      "name": "Living Room",
+      "ip": "192.168.1.50",
+      "token": "00000000000000000000000000000000",
+      "model": "xiaomi.airp.cpa4m"
+    }
+  ],
   "waqi_token": "",
   "location": {
     "lat": 28.6139,

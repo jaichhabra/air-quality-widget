@@ -7,6 +7,8 @@ not through Xiaomi's cloud.
 
 - **Inside**: live PM2.5 from the purifier (every 30 s), shown as AQI with a
   colour scale, plus power, mode and fan speed controls.
+- **Several purifiers**: click the room name to switch between them, or choose
+  *Add purifier…* to find a new one on your network.
 - **Outside**: PM2.5 for your coordinates (every 10 min), from the nearest
   official monitoring station via [WAQI](https://aqicn.org/data-platform/token/)
   if you add a free token, otherwise Open-Meteo's modelled estimate.
@@ -34,28 +36,33 @@ does not build on Windows; `netifaces-plus` replaces it.
 
 ## Setup
 
-1. Copy `purifier.example.json` to `purifier.json` and fill it in. That file is
-   git-ignored, keep it private: the token lets anyone on your network control
-   the purifier.
-   - `ip`, `token`, `model`: get them with
-     [Xiaomi Cloud Tokens Extractor](https://github.com/PiotrMachowski/Xiaomi-cloud-tokens-extractor)
-     (QR-code login works for accounts created with Sign in with Apple).
+1. Get each purifier's token with
+   [Xiaomi Cloud Tokens Extractor](https://github.com/PiotrMachowski/Xiaomi-cloud-tokens-extractor)
+   (QR-code login works for accounts created with Sign in with Apple). Save its
+   output with `-o devices.json` to skip copying tokens by hand.
+2. Add your purifiers. The wizard scans your network, asks for the token (or
+   the extractor's JSON file), tests the connection and saves it:
+
+   ```bash
+   python purifier.py add
+   ```
+
+3. Copy `location` and `waqi_token` from `purifier.example.json` into
+   `purifier.json` and set them:
    - `location`: your coordinates, a short label, and the AQI page to open
      when you double-click Outside.
    - `waqi_token` (optional): for real station readings outdoors.
-2. Check the connection:
 
-   ```bash
-   python purifier.py
-   ```
-
-3. Start the widget by double-clicking `aqi_widget.pyw`.
+   `purifier.json` is git-ignored. Keep it private: a token lets anyone on your
+   network control that purifier.
+4. Start the widget by double-clicking `aqi_widget.pyw`.
 
 ## Using it
 
 | Action | How |
 | --- | --- |
 | Move | Drag anywhere on the card |
+| Switch or add a purifier | Click the room name (top left) |
 | Power | Round button, bottom left (green when on) |
 | Mode and fan speed | Mode pill, opens a dropdown |
 | AQI scale, refresh, close | Right-click |
@@ -64,7 +71,11 @@ does not build on Windows; `netifaces-plus` replaces it.
 ## Command line
 
 ```bash
-python purifier.py                  # status
+python purifier.py list             # configured purifiers
+python purifier.py add              # find and add a purifier
+python purifier.py remove NAME
+python purifier.py                  # status of the first purifier
+python purifier.py -p Bedroom on    # pick a purifier by name or number
 python purifier.py on | off
 python purifier.py mode auto|sleep|favorite
 python purifier.py level 0-14       # fan level (Favorite mode)

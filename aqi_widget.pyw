@@ -16,6 +16,7 @@ import io
 import json
 import os
 import pathlib
+import sys
 import threading
 import time
 import tkinter as tk
@@ -98,6 +99,8 @@ CARD_W, CARD_H, RADIUS = 348, 224, 26
 MARGIN = 0                  # window = card; corners are truly transparent
 WIN_W, WIN_H = CARD_W + 2 * MARGIN, CARD_H + 2 * MARGIN
 POP_W, POP_H, POP_R = 236, 214, 18   # mode / fan-speed dropdown
+ROOM_W = 220                          # purifier (room) switcher
+BUTTONS = ("power", "mode", "room", "refresh", "close")
 FAN_MAX = 14                          # favourite fan level range on xiaomi.airp.cpa4m (siid 9, piid 11)
 PAD = 22
 GREEN = (48, 209, 88)
@@ -278,10 +281,25 @@ class Renderer:
 
         colw = (CARD_W - 2 * PAD - 36) / 2
         for i, (title, glyph, data, tag) in enumerate(
-                [("BATCAVE", G_HOME, st["inside"], "inside"), ("OUTSIDE", G_PIN, st["outside"], "outside")]):
+                [(st.get("room", "Inside"), G_HOME, st["inside"], "inside"),
+                 ("Outside", G_PIN, st["outside"], "outside")]):
             x = PAD + i * (colw + 36)
-            text(x, 32, glyph, 10.5, icon=True, fill=white(0.55))
-            text(x + 17, 32, title, 10.5, 600, white(0.55), track=0.9)
+            title = title.upper()
+            if i == 0:  # room name: click to switch purifier or add one
+                f = self.font(10.5, 600)
+                while len(title) > 3 and (f.getlength(title) / self.k + 0.9 * len(title)) > colw - 34:
+                    title = title[:-2] + "…"
+                hot = st.get("hover") == "room"
+                if hot:
+                    tw = f.getlength(title) / self.k + 0.9 * len(title)
+                    rrect(x - 7, 17, x + 17 + tw + 20, 37, 10, fill=white(0.12))
+                tw = text(x + 17, 32, title, 10.5, 600, white(0.85 if hot else 0.55), track=0.9)
+                text(x, 32, glyph, 10.5, icon=True, fill=white(0.85 if hot else 0.55))
+                text(x + 17 + tw + 3, 31, G_CHEVRON, 7.5, icon=True, fill=white(0.85 if hot else 0.5))
+                hits.append((ox + x - 7, oy + 17, ox + x + 17 + tw + 20, oy + 37, "room"))
+            else:
+                text(x, 32, glyph, 10.5, icon=True, fill=white(0.55))
+                text(x + 17, 32, title, 10.5, 600, white(0.55), track=0.9)
             if data is None:
                 num, cat, cap1, cap2, aqi = "—", "Loading…", "", "", None
             elif data == "offline":
@@ -343,6 +361,38 @@ class Renderer:
             text(CARD_W - PAD - 66, fy + 4, st["updated"], 11, 400, white(0.42), anchor="rs")
 
         return img.resize(self.size, Image.LANCZOS), hits
+
+    # dropdown: purifiers + add
+    def room_content(self, st):
+        q = self.q
+        n = len(st["items"])
+        W, H = ROOM_W, room_popup_h(n)
+        img = Image.new("RGBA", (q(W), q(H)), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        hits, hov = [], st.get("hover")
+
+        def text(x, y, s, px, wght=400, fill=white(1), anchor="ls", icon=False):
+            d.text((q(x), q(y)), s, font=self.font(px, wght, icon), fill=fill, anchor=anchor)
+
+        for i, name in enumerate(st["items"]):
+            y0, tag, sel = 8 + i * 36, f"room{i}", i == st["sel"]
+            if hov == tag:
+                d.rounded_rectangle([q(6), q(y0), q(W - 6), q(y0 + 34)], q(10), fill=white(0.13))
+            text(18, y0 + 17, G_HOME, 11, icon=True, fill=white(0.9 if sel else 0.5), anchor="lm")
+            text(38, y0 + 22, name, 13.5, 600 if sel else 400, white(1 if sel else 0.85))
+            if sel:
+                text(W - 20, y0 + 17, "", 12, icon=True, fill=white(0.95), anchor="mm")
+            hits.append((6, y0, W - 6, y0 + 34, tag))
+
+        ys = 8 + n * 36 + 4
+        d.line([q(16), q(ys), q(W - 16), q(ys)], fill=white(0.12), width=max(1, q(0.5)))
+        y0 = ys + 5
+        if hov == "add":
+            d.rounded_rectangle([q(6), q(y0), q(W - 6), q(y0 + 34)], q(10), fill=white(0.13))
+        text(18, y0 + 17, "", 11, icon=True, fill=white(0.85), anchor="lm")
+        text(38, y0 + 22, "Add purifier…", 13.5, 400, white(0.85))
+        hits.append((6, y0, W - 6, y0 + 34, "add"))
+        return img.resize((round(W * self.s), round(H * self.s)), Image.LANCZOS), hits
 
     # dropdown: modes + fan speed
     def popup_content(self, st):
@@ -467,24 +517,34 @@ def update_layered(hwnd, img):
 
 
 # ── Dropdown ───────────────────────────────────────────────────────────────
-class Popup(tk.Toplevel):
-    """Glass dropdown under the Mode pill: pick a mode, set the fan speed."""
+def room_popup_h(n):
+    return 8 + n * 36 + 9 + 36 + 8
 
-    def __init__(self, app, x, y):
+
+class Popup(tk.Toplevel):
+    """Glass dropdown. kind="mode": modes + fan speed. kind="room": switch or add purifiers."""
+
+    def __init__(self, app, x, y, kind="mode"):
         super().__init__(app)
-        self.app, self.s = app, app.s
-        W, H = round(POP_W * self.s), round(POP_H * self.s)
+        self.app, self.s, self.kind = app, app.s, kind
+        if kind == "room":
+            names = [p.name for p in app.purifiers]
+            self.lw, self.lh = ROOM_W, room_popup_h(len(names))
+            self.st = {"items": names, "sel": app.sel, "hover": None}
+        else:
+            v = app.st["vals"]
+            self.lw, self.lh = POP_W, POP_H
+            self.st = {"mode": v.get("mode", 0), "level": int(v.get("fan_level") or 0), "hover": None}
+        W, H = round(self.lw * self.s), round(self.lh * self.s)
         self.overrideredirect(True)
         self.geometry(f"{W}x{H}+{x}+{y}")
         self.cv = tk.Canvas(self, width=W, height=H, highlightthickness=0, bd=0, bg="#000000")
         self.cv.pack()
-        v = app.st["vals"]
-        self.st = {"mode": v.get("mode", 0), "level": int(v.get("fan_level") or 0), "hover": None}
         self.hits, self._dragging = [], False
         self.update_idletasks()
         make_layered(self._hwnd())
         self.attributes("-topmost", True)
-        self._bd = app.r.backdrop(self.winfo_x(), self.winfo_y(), POP_W, POP_H, POP_R, tint=(16, 16, 20, 150))
+        self._bd = app.r.backdrop(self.winfo_x(), self.winfo_y(), self.lw, self.lh, POP_R, tint=(16, 16, 20, 150))
         self.redraw()
 
         self.cv.bind("<Motion>", self._motion)
@@ -500,7 +560,8 @@ class Popup(tk.Toplevel):
         return ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()
 
     def redraw(self):
-        content, self.hits = self.app.r.popup_content(self.st)
+        render = self.app.r.room_content if self.kind == "room" else self.app.r.popup_content
+        content, self.hits = render(self.st)
         update_layered(self._hwnd(), Image.alpha_composite(self._bd, content))
 
     def _hit(self, e):
@@ -528,6 +589,14 @@ class Popup(tk.Toplevel):
 
     def _press(self, e):
         tag = self._hit(e)
+        if self.kind == "room":
+            if tag == "add":
+                self.close()
+                self.app.add_purifier()
+            elif tag and tag.startswith("room"):
+                self.close()
+                self.app.select_purifier(int(tag[4:]))
+            return
         if tag == "track":
             self._dragging = True
             self.st["level"] = self._level_at(e)
@@ -583,6 +652,9 @@ class Widget(tk.Tk):
         self.prefs = self._load_prefs()
         self.st = {"inside": None, "outside": None, "vals": {}, "hover": None, "updated": "",
                    "scale": self.prefs.get("scale", "us")}
+        self._cfg_mtime = 0
+        self.purifiers, self.sel = [], 0
+        self._load_purifiers()
         self.hits, self.jobs, self._drag = [], {}, None
         self.popup, self.popup_closed_at = None, 0.0
 
@@ -631,7 +703,7 @@ class Widget(tk.Tk):
         return None
 
     def _set_hover(self, tag):
-        tag = tag if tag in ("power", "mode", "refresh", "close") else None
+        tag = tag if tag in BUTTONS else None
         if tag != self.st["hover"]:
             self.st["hover"] = tag
             self.cv.config(cursor="hand2" if tag else "")
@@ -643,7 +715,7 @@ class Widget(tk.Tk):
 
     def _on_press(self, e):
         tag = self._hit(e)
-        if tag in ("power", "mode", "refresh", "close"):
+        if tag in BUTTONS:
             self._drag = None
             self._pressed = tag
         else:
@@ -661,22 +733,83 @@ class Widget(tk.Tk):
             self._save_pos()
             self._rebackdrop()
         elif self._pressed and self._pressed == self._hit(e):
-            {"power": self.toggle_power, "mode": self.toggle_popup,
+            {"power": self.toggle_power, "mode": lambda: self.toggle_popup("mode"),
+             "room": lambda: self.toggle_popup("room"),
              "refresh": self.refresh_all, "close": self.close}[self._pressed]()
 
-    def toggle_popup(self):
+    def toggle_popup(self, kind):
         if self.popup:
+            same = self.popup.kind == kind
             self.popup.close()
-            return
-        if time.time() - self.popup_closed_at < 0.4 or not self.st["vals"]:
+            if same:
+                return
+        elif time.time() - self.popup_closed_at < 0.4:
             return  # this click is the one that just closed it
-        x0, y0, x1, y1 = next(h[:4] for h in self.hits if h[4] == "mode")
+        if kind == "mode" and not self.st["vals"]:
+            return
+        if kind == "room" and not self.purifiers:
+            return self.add_purifier()
+        h = POP_H if kind == "mode" else room_popup_h(len(self.purifiers))
+        x0, y0, x1, y1 = next(h_[:4] for h_ in self.hits if h_[4] == kind)
         px = self.winfo_x() + round(x0 * self.s)
         py = self.winfo_y() + round((y1 + 8) * self.s)
         mon = monitor_rect(px, py)
-        if py + round(POP_H * self.s) > mon[1] + mon[3]:
-            py = self.winfo_y() + round((y0 - 8 - POP_H) * self.s)
-        self.popup = Popup(self, px, py)
+        if py + round(h * self.s) > mon[1] + mon[3]:
+            py = self.winfo_y() + round((y0 - 8 - h) * self.s)
+        self.popup = Popup(self, px, py, kind)
+
+    # purifiers
+    @property
+    def cur(self):
+        return self.purifiers[self.sel] if self.purifiers else None
+
+    def _load_purifiers(self):
+        """(Re)read purifier.json; called at start and whenever the file changes."""
+        try:
+            mtime = pur.CFG_PATH.stat().st_mtime
+        except OSError:
+            mtime = 0
+        if mtime == self._cfg_mtime:
+            return False
+        self._cfg_mtime = mtime
+        self.purifiers = pur.purifiers(pur.load_cfg())
+        names = [p.name for p in self.purifiers]
+        want = self.prefs.get("purifier")
+        self.sel = names.index(want) if want in names else 0
+        self.st["room"] = self.cur.name if self.cur else "Add purifier"
+        return True
+
+    def select_purifier(self, i):
+        if i == self.sel or i >= len(self.purifiers):
+            return
+        self.sel = i
+        self.prefs["purifier"] = self.cur.name
+        self._save_pos()
+        self.st.update(room=self.cur.name, inside=None, vals={})
+        self.redraw()
+        self.refresh_inside()
+
+    def add_purifier(self):
+        """Open the add-purifier wizard in its own console window."""
+        import subprocess
+        exe = pathlib.Path(sys.executable)
+        if exe.name.lower() == "pythonw.exe":
+            exe = exe.with_name("python.exe")
+        here = pathlib.Path(__file__).resolve().parent
+        subprocess.Popen([str(exe), str(here / "purifier.py"), "add"], cwd=str(here),
+                         creationflags=subprocess.CREATE_NEW_CONSOLE)
+        self._watch_cfg()
+
+    def _watch_cfg(self, tries=600):
+        """After launching the wizard, pick up the new purifier as soon as it is saved."""
+        if self._load_purifiers():
+            if len(self.purifiers) > 0:
+                self.select_purifier(len(self.purifiers) - 1)
+                self.st["room"] = self.cur.name
+                self.redraw()
+            return
+        if tries:
+            self.after(1000, self._watch_cfg, tries - 1)
 
     def _set_scale(self):
         self.st["scale"] = self.prefs["scale"] = self.scale_var.get()
@@ -710,7 +843,19 @@ class Widget(tk.Tk):
         self.refresh_outside()
 
     def refresh_inside(self):
-        self._bg(pur.get_all, self._got_inside)
+        self._load_purifiers()
+        p = self.cur
+        if not p:
+            self.st["inside"] = "offline"
+            self.redraw()
+            return self._schedule("in", INSIDE_MS, self.refresh_inside)
+        self._bg(p.get_all, lambda v, err, p=p: self._got_for(p, v, err))
+
+    def _got_for(self, p, v, err):
+        if self.cur and (p.name, p.ip) == (self.cur.name, self.cur.ip):
+            self._got_inside(v, err)
+        else:  # reading belongs to a purifier we've since switched away from
+            self._schedule("in", 500, self.refresh_inside)
 
     def _got_inside(self, v, err):
         if err:
@@ -724,7 +869,7 @@ class Widget(tk.Tk):
             else:
                 cap = "Purifier · " + pur.MODES.get(v["mode"], "").capitalize()
             self.st["inside"] = (v["pm25"], cap)
-            if self.popup and not self.popup._dragging:
+            if self.popup and self.popup.kind == "mode" and not self.popup._dragging:
                 self.popup.st["mode"], self.popup.st["level"] = v["mode"], int(v["fan_level"] or 0)
                 self.popup.redraw()
             self._stamp()
@@ -749,13 +894,15 @@ class Widget(tk.Tk):
         v = self.st["vals"]
         if v:
             new = not v["power"]
-            self._bg(lambda: pur.set_prop("power", new), lambda *_: self.refresh_inside())
+            p = self.cur
+            self._bg(lambda: p.set_prop("power", new), lambda *_: self.refresh_inside())
 
     def set_mode(self, mode):
         if self.st["vals"]:
             self.st["vals"]["mode"] = mode
             self.redraw()
-            self._bg(lambda: pur.set_prop("mode", mode), lambda *_: self.refresh_inside())
+            p = self.cur
+            self._bg(lambda: p.set_prop("mode", mode), lambda *_: self.refresh_inside())
 
     def set_fan_level(self, level):
         """Fan level only applies in Favorite mode, so switch to it as well."""
@@ -766,10 +913,12 @@ class Widget(tk.Tk):
         v["mode"], v["fan_level"] = 2, level
         self.redraw()
 
+        p = self.cur
+
         def send():
-            pur.set_prop("fan_level", level)
+            p.set_prop("fan_level", level)
             if switch:
-                pur.set_prop("mode", 2)
+                p.set_prop("mode", 2)
         self._bg(send, lambda *_: self.refresh_inside())
 
     # desktop placement
