@@ -57,10 +57,20 @@ US_BP = [(0, 50, 0.0, 9.0), (51, 100, 9.1, 35.4), (101, 150, 35.5, 55.4),
 
 
 US_LABELS = ["Good", "Moderate", "Unhealthy for Some", "Unhealthy", "Very Unhealthy", "Hazardous"]
-SCALES = {"us": "US AQI (like aqi.in)", "in": "India NAQI (CPCB)"}
+# China HJ 633-2012, PM2.5 sub-index: what Xiaomi's Mi Home app shows as "AQI"
+CN_BANDS = [(0, 35, 0, 50, "Excellent"), (35, 75, 50, 100, "Good"), (75, 115, 100, 150, "Light Pollution"),
+            (115, 150, 150, 200, "Moderate Pollution"), (150, 250, 200, 300, "Heavy Pollution"),
+            (250, 350, 300, 400, "Severe Pollution"), (350, 500, 400, 500, "Severe Pollution")]
+SCALES = {"us": "US AQI (like aqi.in)", "cn": "China AQI (like the Mi Home app)", "in": "India NAQI (CPCB)"}
+SCALE_TAGS = {"us": "US AQI", "cn": "CN AQI", "in": "NAQI"}
 
 
 def aqi_from_pm25(pm, scale="us"):
+    if scale == "cn":
+        for clo, chi, alo, ahi, label in CN_BANDS:
+            if pm <= chi:
+                return round(alo + (max(pm, clo) - clo) * (ahi - alo) / (chi - clo)), label
+        return 500, "Severe Pollution"
     if scale == "us":  # US EPA 2024 PM2.5 breakpoints
         for (ilo, ihi, clo, chi), label in zip(US_BP, US_LABELS):
             if pm <= chi + 0.05:
@@ -316,9 +326,9 @@ class Renderer:
                 num, cat, cap1, cap2, aqi = "—", "Unavailable", "Retrying shortly", "", None
             else:
                 pm, cap2 = data
-                scale = st.get("scale", "us")
+                scale = st.get("scale", "cn")
                 aqi, cat = aqi_from_pm25(pm, scale)
-                index = "US AQI" if scale == "us" else "NAQI"
+                index = SCALE_TAGS[scale]
                 if st.get("metric") == "pm25":  # same number the purifier's own app shows
                     num, unit, cap1 = f"{pm:.0f}", "µg/m³", f"{index} {aqi}"
                 else:
@@ -687,18 +697,20 @@ class Widget(tk.Tk):
         self.cv.pack()
         self.prefs = self._load_prefs()
         self.st = {"inside": None, "outside": None, "vals": {}, "hover": None, "updated": "",
-                   "scale": self.prefs.get("scale", "us"), "metric": self.prefs.get("metric", "aqi")}
+                   "metric": self.prefs.get("metric", "aqi"),
+                   # one scale for both sides; China AQI matches what Xiaomi's Mi Home app shows
+                   "scale": self.prefs.get("scale2", "cn")}
         self._cfg_mtime = 0
         self.purifiers, self.sel = [], 0
         self._load_purifiers()
         self.hits, self.jobs, self._drag = [], {}, None
         self.popup, self.popup_closed_at = None, 0.0
 
-        self.scale_var = tk.StringVar(value=self.st["scale"])
         self.menu = tk.Menu(self, tearoff=0)
         self.menu.add_command(label="Refresh", command=self.refresh_all)
         self.menu.add_command(label=f"Open {REFERENCE_NAME}", command=lambda: webbrowser.open(REFERENCE_URL))
         self.menu.add_separator()
+        self.scale_var = tk.StringVar(value=self.st["scale"])
         for key, label in SCALES.items():
             self.menu.add_radiobutton(label=label, value=key, variable=self.scale_var, command=self._set_scale)
         self.metric_var = tk.StringVar(value=self.st["metric"])
@@ -859,7 +871,7 @@ class Widget(tk.Tk):
             self.after(1000, self._watch_cfg, tries - 1)
 
     def _set_scale(self):
-        self.st["scale"] = self.prefs["scale"] = self.scale_var.get()
+        self.st["scale"] = self.prefs["scale2"] = self.scale_var.get()
         self._save_pos()
         self.redraw()
 
