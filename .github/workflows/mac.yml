@@ -1,0 +1,32 @@
+name: macOS app
+
+on:
+  push:
+    paths: ["mac/**", "icon.png", ".github/workflows/mac.yml"]
+  pull_request:
+    paths: ["mac/**", "icon.png", ".github/workflows/mac.yml"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: swift --version
+
+      - name: Unit tests
+        working-directory: mac
+        run: swift test
+
+      - name: Build app
+        working-directory: mac
+        run: bash scripts/make_app.sh
+
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: AirQuality-mac
+          path: mac/dist/AirQuality-mac.zip
+          if-no-files-found: error
