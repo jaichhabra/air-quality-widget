@@ -1,0 +1,14 @@
+{
+  "name": "Air Purifier",
+  "ip": "192.168.1.50",
+  "token": "00000000000000000000000000000000",
+  "model": "xiaomi.airp.cpa4m",
+  "waqi_token": "",
+  "location": {
+    "lat": 28.6139,
+    "lon": 77.2090,
+    "label": "New Delhi",
+    "reference_name": "aqi.in",
+    "reference_url": "https://www.aqi.in/"
+  }
+}

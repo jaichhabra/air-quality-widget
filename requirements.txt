@@ -1,0 +1,4 @@
+python-miio==0.5.12
+pillow>=10
+# python-miio needs netifaces, which has no Windows wheel; this drop-in does:
+netifaces-plus

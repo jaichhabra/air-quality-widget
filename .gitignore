@@ -1,0 +1,8 @@
+# Secrets and personal settings: never commit
+purifier.json
+aqi_widget_pos.json
+mi_devices.json
+*.token
+
+__pycache__/
+*.pyc
